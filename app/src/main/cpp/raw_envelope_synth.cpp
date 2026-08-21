@@ -213,8 +213,6 @@ bool BuildPitch(const std::vector<double>& x, int fs,
       }
     }
 
-    // A chromatic sample is one sustained note. Keep real inflection/vibrato,
-    // but never let a tracker octave error create a different character voice.
     const double cents = Clamp(1200.0 * std::log2(value / reference), -360.0, 360.0);
     (*f0)[i] = reference * std::pow(2.0, cents / 1200.0);
     (*confidence)[i] = Clamp(conf, 0.0, 1.0);
@@ -277,8 +275,6 @@ void BuildHarmonicEnvelope(const std::vector<double>& power, double f0, int fs,
     for (int b = from + 1; b <= to; ++b) {
       if (power[b] > power[peak]) peak = b;
     }
-    // Average the peak and its immediate neighbors so one FFT-bin accident
-    // cannot redefine a formant.
     double p = 0.0;
     double w = 0.0;
     for (int d = -1; d <= 1; ++d) {
@@ -296,9 +292,6 @@ void BuildHarmonicEnvelope(const std::vector<double>& power, double f0, int fs,
     return;
   }
 
-  // Interpolate the measured harmonic amplitudes over frequency. Unlike
-  // CheapTrick, these points come directly from the waveform, so F1/F2 stay at
-  // the frequencies that actually made the source sound like A/E/I/O/U.
   size_t right = 1;
   for (int b = 0; b < bins; ++b) {
     while (right < harmonic_bin.size() && b > harmonic_bin[right]) ++right;
@@ -306,7 +299,6 @@ void BuildHarmonicEnvelope(const std::vector<double>& power, double f0, int fs,
     if (b <= harmonic_bin.front()) {
       log_value = harmonic_log.front();
     } else if (right >= harmonic_bin.size()) {
-      // Preserve the source spectral tilt rather than making the top end flat.
       const size_t n = harmonic_bin.size();
       const double dx = std::max(1, harmonic_bin[n - 1] - harmonic_bin[n - 2]);
       const double slope = Clamp((harmonic_log[n - 1] - harmonic_log[n - 2]) / dx,
@@ -321,8 +313,6 @@ void BuildHarmonicEnvelope(const std::vector<double>& power, double f0, int fs,
     (*envelope)[b] = std::exp(log_value);
   }
 
-  // Very small frequency smoothing removes corners from the piecewise-linear
-  // harmonic envelope without moving broad formant peaks.
   const int radius = std::max(1, static_cast<int>(std::llround(45.0 / bin_hz)));
   std::vector<double> smooth(*envelope);
   for (int b = 0; b < bins; ++b) {
@@ -350,9 +340,13 @@ bool AnalyzeRawEnvelope(const std::vector<double>& x, int fs,
                    std::vector<double>(static_cast<size_t>(bins), 1e-12));
 
   std::vector<double> fft_in(static_cast<size_t>(fft_size), 0.0);
-  std::vector<fft_complex> fft_out(static_cast<size_t>(bins));
+  // WORLD declares fft_complex as double[2]. An array type cannot be stored
+  // directly in std::vector with Android libc++, so reserve two doubles per
+  // complex bin and view the contiguous storage through WORLD's expected type.
+  std::vector<double> fft_storage(static_cast<size_t>(bins) * 2u, 0.0);
+  fft_complex* fft_out = reinterpret_cast<fft_complex*>(fft_storage.data());
   fft_plan plan = fft_plan_dft_r2c_1d(
-      fft_size, fft_in.data(), fft_out.data(), FFT_ESTIMATE);
+      fft_size, fft_in.data(), fft_out, FFT_ESTIMATE);
 
   for (int frame = 0; frame < frames; ++frame) {
     std::fill(fft_in.begin(), fft_in.end(), 0.0);
@@ -385,8 +379,6 @@ bool AnalyzeRawEnvelope(const std::vector<double>& x, int fs,
 
   fft_destroy_plan(plan);
 
-  // Suppress isolated analysis-frame mistakes while retaining actual vowel
-  // motion. Three-frame median in log-power does not move formant frequencies.
   if (frames >= 3) {
     std::vector<std::vector<double>> stabilized(*envelope);
     for (int i = 1; i < frames - 1; ++i) {
@@ -405,8 +397,6 @@ bool AnalyzeRawEnvelope(const std::vector<double>& x, int fs,
 
 double SourcePosition(double u) {
   u = Clamp(u, 0.0, 1.0);
-  // The outer 10% of the result traverses the source edges. Most added time is
-  // spent inside the stable center of the selected vowel.
   constexpr double out_edge = 0.10;
   constexpr double src_edge = 0.18;
   if (u <= out_edge) return (u / out_edge) * src_edge;
@@ -460,8 +450,6 @@ Java_com_vitkkk_vocalstretcher_WorldVocoderEngine_nativeSynthesizeRawEnvelope(
     return nullptr;
   }
 
-  // Keep D4C only for harmonic-vs-noise character. The actual vowel identity
-  // now comes from raw harmonic measurements, not CheapTrick.
   D4COption d4c;
   InitializeD4COption(&d4c);
   std::vector<std::vector<double>> aper(
@@ -471,8 +459,6 @@ Java_com_vitkkk_vocalstretcher_WorldVocoderEngine_nativeSynthesizeRawEnvelope(
   D4C(x.data(), input_length, sample_rate, time_axis.data(), f0.data(), frame_count,
       fft_size, &d4c, aper_ptr.data());
 
-  // Form a central reference only for outlier clipping. Unlike v0.5.5, this is
-  // NOT blended into every frame, so it cannot turn A into an averaged O/I.
   int anchor_from = std::max(0, frame_count / 5);
   int anchor_to = std::max(anchor_from + 1, frame_count - frame_count / 5);
   anchor_to = std::min(frame_count, anchor_to);
@@ -496,12 +482,10 @@ Java_com_vitkkk_vocalstretcher_WorldVocoderEngine_nativeSynthesizeRawEnvelope(
     const double gain = Clamp(Median(gain_values), -1.0, 1.0);
     for (int b = 0; b < bins; ++b) {
       const double local = std::log(std::max(1e-14, raw_envelope[i][b]));
-      // Only clip catastrophic envelope mistakes. Normal formant movement is
-      // left at 100% instead of being pulled toward a synthetic median vowel.
       const double deviation = local - anchor_log[b] - gain;
       const double limit_db = b * sample_rate / static_cast<double>(fft_size) < 5500.0
                                   ? 9.0 : 12.0;
-      const double limit = limit_db * std::log(10.0) / 10.0;  // power-domain dB
+      const double limit = limit_db * std::log(10.0) / 10.0;
       safe_envelope[i][b] = std::exp(anchor_log[b] + gain +
                                      Clamp(deviation, -limit, limit));
     }
