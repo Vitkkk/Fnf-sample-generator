@@ -19,6 +19,8 @@ final class WaveformViewV2 extends View {
     private final Paint playheadPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint selectionPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint boundaryPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint stretchPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint stretchBoundaryPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint auditionPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final ScaleGestureDetector scaleDetector;
 
@@ -27,6 +29,8 @@ final class WaveformViewV2 extends View {
     private int playhead = 0;
     private int selectionStart = -1;
     private int selectionEnd = -1;
+    private int stretchStart = -1;
+    private int stretchEnd = -1;
     private int auditionStart = -1;
     private double framesPerPixel = 1.0;
     private double visibleStart = 0.0;
@@ -41,9 +45,18 @@ final class WaveformViewV2 extends View {
         centerPaint.setStrokeWidth(1f);
         playheadPaint.setColor(Color.rgb(210, 32, 32));
         playheadPaint.setStrokeWidth(context.getResources().getDisplayMetrics().density * 1.5f);
-        selectionPaint.setColor(Color.argb(52, 255, 145, 0));
+
+        selectionPaint.setColor(Color.argb(48, 255, 145, 0));
         boundaryPaint.setColor(Color.rgb(235, 125, 0));
         boundaryPaint.setStrokeWidth(context.getResources().getDisplayMetrics().density * 1.6f);
+
+        // Inner sustain region. It deliberately uses a different hue from the
+        // final sample cut so the user can see "what is exported" vs
+        // "what is actually lengthened" at the same time.
+        stretchPaint.setColor(Color.argb(70, 0, 190, 120));
+        stretchBoundaryPaint.setColor(Color.rgb(0, 145, 90));
+        stretchBoundaryPaint.setStrokeWidth(context.getResources().getDisplayMetrics().density * 2f);
+
         auditionPaint.setColor(Color.rgb(35, 95, 220));
         auditionPaint.setStrokeWidth(context.getResources().getDisplayMetrics().density * 2f);
 
@@ -74,6 +87,8 @@ final class WaveformViewV2 extends View {
         visibleStart = 0.0;
         selectionStart = -1;
         selectionEnd = -1;
+        stretchStart = -1;
+        stretchEnd = -1;
         auditionStart = -1;
         fitToScreen();
         invalidate();
@@ -89,6 +104,12 @@ final class WaveformViewV2 extends View {
     void setSelection(int start, int end) {
         selectionStart = start;
         selectionEnd = end;
+        invalidate();
+    }
+
+    void setStretchRegion(int start, int end) {
+        stretchStart = start;
+        stretchEnd = end;
         invalidate();
     }
 
@@ -126,6 +147,14 @@ final class WaveformViewV2 extends View {
                 canvas.drawLine(x2, 0, x2, height, boundaryPaint);
             }
             canvas.drawLine(x1, 0, x1, height, boundaryPaint);
+        }
+
+        if (stretchStart >= 0 && stretchEnd > stretchStart) {
+            float sx1 = frameToX(stretchStart);
+            float sx2 = frameToX(stretchEnd);
+            canvas.drawRect(new RectF(Math.min(sx1, sx2), 0, Math.max(sx1, sx2), height), stretchPaint);
+            canvas.drawLine(sx1, 0, sx1, height, stretchBoundaryPaint);
+            canvas.drawLine(sx2, 0, sx2, height, stretchBoundaryPaint);
         }
 
         float amplitude = height * 0.42f;
