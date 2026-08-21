@@ -44,6 +44,7 @@ set_target_properties(world_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(vocal_world SHARED
     native_vocoder.cpp
+    identity_synth.cpp
     native_audio_decoder.cpp
 )
 target_include_directories(vocal_world PRIVATE ${miniaudio_source_SOURCE_DIR})
