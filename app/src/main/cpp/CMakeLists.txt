@@ -44,11 +44,15 @@ set_target_properties(world_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(vocal_world SHARED
     native_vocoder.cpp
-    identity_synth.cpp
     raw_envelope_synth.cpp
     native_audio_decoder.cpp
 )
 target_include_directories(vocal_world PRIVATE ${miniaudio_source_SOURCE_DIR})
 target_compile_features(vocal_world PRIVATE cxx_std_17)
 target_compile_options(vocal_world PRIVATE -O3 -ffast-math)
+# Keep the Java API stable while replacing the v0.5.5 CheapTrick identity
+# engine with the raw-harmonic-envelope implementation.
+target_compile_definitions(vocal_world PRIVATE
+    Java_com_vitkkk_vocalstretcher_WorldVocoderEngine_nativeSynthesizeRawEnvelope=Java_com_vitkkk_vocalstretcher_WorldVocoderEngine_nativeSynthesizeIdentityLocked
+)
 target_link_libraries(vocal_world PRIVATE world_core log)
