@@ -1,12 +1,18 @@
 package com.vitkkk.vocalstretcher;
 
+import java.util.Arrays;
+
 /**
  * Vowel synthesis based on WORLD's source/filter representation.
  *
- * This is deliberately different from PSOLA/WSOLA/granular stretching: the
- * selected waveform is first analyzed, then a NEW waveform is synthesized from
- * F0 + spectral envelope + aperiodicity. The original PCM is only used for the
- * short crossfades at the boundaries of the edited region.
+ * v0.5.3 quality guard:
+ * - find the stable voiced core of the user's selection first;
+ * - preserve any attack/release outside that core as original PCM;
+ * - spend all added duration on the voiced core;
+ * - refuse synthesis when no trustworthy vowel core exists.
+ *
+ * This prevents breath/silence/consonant frames from being stretched into the
+ * old whisper/TTS-like failure mode while leaving already-good samples alone.
  */
 final class WorldVocoderEngine {
     static {
@@ -31,47 +37,96 @@ final class WorldVocoderEngine {
             return new AudioData(in.sampleRate, in.channels, in.samples.clone());
         }
 
-        float[] mono = new float[sourceFrames];
+        float[] selectedMono = new float[sourceFrames];
         for (int f = 0; f < sourceFrames; f++) {
-            mono[f] = in.monoAt(startFrame + f);
+            selectedMono[f] = in.monoAt(startFrame + f);
         }
 
-        float[] synthesized = nativeSynthesizeVowel(mono, in.sampleRate, targetFrames);
-        if (synthesized == null || synthesized.length != targetFrames) {
-            throw new IllegalStateException("O sintetizador WORLD não retornou o tamanho solicitado.");
+        int[] coreInfo = nativeFindStableVoicedCore(selectedMono, in.sampleRate);
+        if (coreInfo == null || coreInfo.length < 3) {
+            throw new IllegalArgumentException(
+                    "Não encontrei uma vogal vozeada estável dentro dos cortes. Ajuste os cortes para pegar mais do A/E/I/O/U e menos silêncio, sopro ou consoante.");
+        }
+
+        int coreStart = clamp(coreInfo[0], 0, sourceFrames - 1);
+        int coreEnd = clamp(coreInfo[1], coreStart + 1, sourceFrames);
+        int quality = coreInfo[2];
+        int coreSourceFrames = coreEnd - coreStart;
+
+        int minimumCore = Math.max(128, (int) Math.round(in.sampleRate * 0.040));
+        if (coreSourceFrames < minimumCore || quality < 330) {
+            throw new IllegalArgumentException(
+                    "A seleção tem voz pouco estável para alongar sem destruir o timbre. Tente selecionar um trecho mais limpo e sustentado da vogal.");
+        }
+
+        int attackFrames = coreStart;
+        int releaseFrames = sourceFrames - coreEnd;
+        int targetCoreFrames = targetFrames - attackFrames - releaseFrames;
+        if (targetCoreFrames < coreSourceFrames) {
+            // targetFrames >= sourceFrames, so this is only a defensive guard.
+            targetCoreFrames = coreSourceFrames;
+        }
+
+        float[] coreMono = Arrays.copyOfRange(selectedMono, coreStart, coreEnd);
+        float[] synthesized = nativeSynthesizeVowel(coreMono, in.sampleRate, targetCoreFrames);
+        if (synthesized == null || synthesized.length != targetCoreFrames) {
+            throw new IllegalStateException(
+                    "O WORLD rejeitou esta vogal porque a análise de pitch/vozeamento ficou insegura. Ajuste um pouco os cortes e tente novamente.");
         }
 
         removeDc(synthesized);
-        matchRms(mono, synthesized);
+        matchRms(coreMono, synthesized);
         softLimit(synthesized);
 
         int channels = in.channels;
-        float[] channelGain = estimateChannelGains(in, startFrame, endFrame);
+        int absoluteCoreStart = startFrame + coreStart;
+        int absoluteCoreEnd = startFrame + coreEnd;
+        float[] channelGain = estimateChannelGains(in, absoluteCoreStart, absoluteCoreEnd);
         float[] stretched = new float[targetFrames * channels];
-        for (int f = 0; f < targetFrames; f++) {
+
+        // Keep everything before the stable vowel core literally untouched.
+        if (attackFrames > 0) {
+            System.arraycopy(in.samples, startFrame * channels, stretched, 0,
+                    attackFrames * channels);
+        }
+
+        // The extra duration exists ONLY here: a newly synthesized voiced core.
+        int coreOutStart = attackFrames;
+        for (int f = 0; f < targetCoreFrames; f++) {
             float s = synthesized[f];
-            int base = f * channels;
+            int base = (coreOutStart + f) * channels;
             for (int c = 0; c < channels; c++) {
                 stretched[base + c] = AudioData.clamp(s * channelGain[c]);
             }
         }
 
-        // The body is 100% synthesized. Only a very short boundary crossfade
-        // uses original PCM so the edit joins the untouched file without clicks.
-        int fade = Math.min(sourceFrames / 4, targetFrames / 4);
-        fade = Math.min(fade, Math.max(16, (int) Math.round(in.sampleRate * 0.018)));
+        // Keep everything after the stable vowel core literally untouched.
+        int releaseOutStart = attackFrames + targetCoreFrames;
+        if (releaseFrames > 0) {
+            System.arraycopy(in.samples, absoluteCoreEnd * channels, stretched,
+                    releaseOutStart * channels, releaseFrames * channels);
+        }
+
+        // Tiny joins only. The body is still 100% WORLD resynthesis.
+        int fade = Math.min(coreSourceFrames / 4, targetCoreFrames / 4);
+        fade = Math.min(fade, Math.max(16, (int) Math.round(in.sampleRate * 0.012)));
         if (fade > 1) {
             for (int i = 0; i < fade; i++) {
                 float t = i / (float) (fade - 1);
-                int outStart = i * channels;
-                int srcStart = (startFrame + i) * channels;
-                int outEndFrame = targetFrames - fade + i;
-                int srcEndFrame = endFrame - fade + i;
+
+                int outStart = (coreOutStart + i) * channels;
+                int srcStart = (absoluteCoreStart + i) * channels;
+
+                int outEndFrame = coreOutStart + targetCoreFrames - fade + i;
+                int srcEndFrame = absoluteCoreEnd - fade + i;
                 int outEnd = outEndFrame * channels;
                 int srcEnd = srcEndFrame * channels;
+
                 for (int c = 0; c < channels; c++) {
-                    stretched[outStart + c] = equalPower(in.samples[srcStart + c], stretched[outStart + c], t);
-                    stretched[outEnd + c] = equalPower(stretched[outEnd + c], in.samples[srcEnd + c], t);
+                    stretched[outStart + c] = equalPower(
+                            in.samples[srcStart + c], stretched[outStart + c], t);
+                    stretched[outEnd + c] = equalPower(
+                            stretched[outEnd + c], in.samples[srcEnd + c], t);
                 }
             }
         }
@@ -86,6 +141,9 @@ final class WorldVocoderEngine {
                 (startFrame + targetFrames) * channels, suffixSamples);
         return new AudioData(in.sampleRate, channels, out);
     }
+
+    /** Returns {startSampleInclusive, endSampleExclusive, quality0to1000}. */
+    private static native int[] nativeFindStableVoicedCore(float[] monoSamples, int sampleRate);
 
     private static native float[] nativeSynthesizeVowel(float[] monoSamples, int sampleRate, int targetFrames);
 
