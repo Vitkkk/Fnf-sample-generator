@@ -5,14 +5,13 @@ import java.util.Arrays;
 /**
  * Vowel synthesis based on WORLD's source/filter representation.
  *
- * v0.5.3 quality guard:
- * - find the stable voiced core of the user's selection first;
- * - preserve any attack/release outside that core as original PCM;
- * - spend all added duration on the voiced core;
- * - refuse synthesis when no trustworthy vowel core exists.
- *
- * This prevents breath/silence/consonant frames from being stretched into the
- * old whisper/TTS-like failure mode while leaving already-good samples alone.
+ * v0.5.4:
+ * - the stable core is detected from waveform periodicity, not only DIO's
+ *   voiced/unvoiced label;
+ * - short, clear FNF/character vowels are accepted even when WORLD's pitch
+ *   detector drops frames;
+ * - attack/release outside the periodic core remain original PCM;
+ * - the added duration is spent only on the synthesized vowel core.
  */
 final class WorldVocoderEngine {
     static {
@@ -26,9 +25,9 @@ final class WorldVocoderEngine {
         endFrame = clamp(endFrame, startFrame, in.frameCount());
         int sourceFrames = endFrame - startFrame;
 
-        int minimumFrames = Math.max(256, (int) Math.round(in.sampleRate * 0.060));
+        int minimumFrames = Math.max(256, (int) Math.round(in.sampleRate * 0.050));
         if (sourceFrames < minimumFrames) {
-            throw new IllegalArgumentException("Selecione pelo menos ~60 ms de uma vogal limpa para a síntese WORLD.");
+            throw new IllegalArgumentException("Selecione pelo menos ~50 ms da vogal para a síntese WORLD.");
         }
         if (targetFrames < sourceFrames) {
             throw new IllegalArgumentException("A nova duração precisa ser maior ou igual à região selecionada.");
@@ -45,7 +44,7 @@ final class WorldVocoderEngine {
         int[] coreInfo = nativeFindStableVoicedCore(selectedMono, in.sampleRate);
         if (coreInfo == null || coreInfo.length < 3) {
             throw new IllegalArgumentException(
-                    "Não encontrei uma vogal vozeada estável dentro dos cortes. Ajuste os cortes para pegar mais do A/E/I/O/U e menos silêncio, sopro ou consoante.");
+                    "Não consegui detectar periodicidade suficiente nesse trecho. Se você está ouvindo uma vogal limpa, tente ampliar só alguns milissegundos para cada lado e tente novamente.");
         }
 
         int coreStart = clamp(coreInfo[0], 0, sourceFrames - 1);
@@ -53,17 +52,16 @@ final class WorldVocoderEngine {
         int quality = coreInfo[2];
         int coreSourceFrames = coreEnd - coreStart;
 
-        int minimumCore = Math.max(128, (int) Math.round(in.sampleRate * 0.040));
-        if (coreSourceFrames < minimumCore || quality < 330) {
+        int minimumCore = Math.max(96, (int) Math.round(in.sampleRate * 0.025));
+        if (coreSourceFrames < minimumCore || quality < 140) {
             throw new IllegalArgumentException(
-                    "A seleção tem voz pouco estável para alongar sem destruir o timbre. Tente selecionar um trecho mais limpo e sustentado da vogal.");
+                    "O trecho ficou curto ou pouco periódico demais para alongar com segurança. Tente pegar um pouco mais da mesma vogal.");
         }
 
         int attackFrames = coreStart;
         int releaseFrames = sourceFrames - coreEnd;
         int targetCoreFrames = targetFrames - attackFrames - releaseFrames;
         if (targetCoreFrames < coreSourceFrames) {
-            // targetFrames >= sourceFrames, so this is only a defensive guard.
             targetCoreFrames = coreSourceFrames;
         }
 
@@ -71,7 +69,7 @@ final class WorldVocoderEngine {
         float[] synthesized = nativeSynthesizeVowel(coreMono, in.sampleRate, targetCoreFrames);
         if (synthesized == null || synthesized.length != targetCoreFrames) {
             throw new IllegalStateException(
-                    "O WORLD rejeitou esta vogal porque a análise de pitch/vozeamento ficou insegura. Ajuste um pouco os cortes e tente novamente.");
+                    "A análise periódica não ficou confiável o bastante para sintetizar esse trecho sem destruir a voz. Tente mover um pouco os cortes.");
         }
 
         removeDc(synthesized);
@@ -84,13 +82,11 @@ final class WorldVocoderEngine {
         float[] channelGain = estimateChannelGains(in, absoluteCoreStart, absoluteCoreEnd);
         float[] stretched = new float[targetFrames * channels];
 
-        // Keep everything before the stable vowel core literally untouched.
         if (attackFrames > 0) {
             System.arraycopy(in.samples, startFrame * channels, stretched, 0,
                     attackFrames * channels);
         }
 
-        // The extra duration exists ONLY here: a newly synthesized voiced core.
         int coreOutStart = attackFrames;
         for (int f = 0; f < targetCoreFrames; f++) {
             float s = synthesized[f];
@@ -100,14 +96,12 @@ final class WorldVocoderEngine {
             }
         }
 
-        // Keep everything after the stable vowel core literally untouched.
         int releaseOutStart = attackFrames + targetCoreFrames;
         if (releaseFrames > 0) {
             System.arraycopy(in.samples, absoluteCoreEnd * channels, stretched,
                     releaseOutStart * channels, releaseFrames * channels);
         }
 
-        // Tiny joins only. The body is still 100% WORLD resynthesis.
         int fade = Math.min(coreSourceFrames / 4, targetCoreFrames / 4);
         fade = Math.min(fade, Math.max(16, (int) Math.round(in.sampleRate * 0.012)));
         if (fade > 1) {
