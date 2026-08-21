@@ -3,15 +3,14 @@ package com.vitkkk.vocalstretcher;
 import java.util.Arrays;
 
 /**
- * Vowel synthesis based on WORLD's source/filter representation.
+ * WORLD-based vowel synthesis.
  *
- * v0.5.4:
- * - the stable core is detected from waveform periodicity, not only DIO's
- *   voiced/unvoiced label;
- * - short, clear FNF/character vowels are accepted even when WORLD's pitch
- *   detector drops frames;
- * - attack/release outside the periodic core remain original PCM;
- * - the added duration is spent only on the synthesized vowel core.
+ * v0.5.5:
+ * - chooses the cleanest analysis source among L, R and L+R for stereo files;
+ * - uses octave-locked pitch tracking for one-note chromatic samples;
+ * - uses a formant/spectral identity anchor so A cannot drift into I/O;
+ * - preserves natural loudness/pitch motion inside safe limits;
+ * - attack/release outside the periodic core remain original PCM.
  */
 final class WorldVocoderEngine {
     static {
@@ -19,6 +18,20 @@ final class WorldVocoderEngine {
     }
 
     private WorldVocoderEngine() {}
+
+    private static final class AnalysisChoice {
+        final float[] samples;
+        final int[] coreInfo;
+        final int mode; // 0..channels-1 = channel, channels = mono/mid
+        final int score;
+
+        AnalysisChoice(float[] samples, int[] coreInfo, int mode, int score) {
+            this.samples = samples;
+            this.coreInfo = coreInfo;
+            this.mode = mode;
+            this.score = score;
+        }
+    }
 
     static AudioData stretchRegion(AudioData in, int startFrame, int endFrame, int targetFrames) {
         startFrame = clamp(startFrame, 0, in.frameCount());
@@ -36,24 +49,19 @@ final class WorldVocoderEngine {
             return new AudioData(in.sampleRate, in.channels, in.samples.clone());
         }
 
-        float[] selectedMono = new float[sourceFrames];
-        for (int f = 0; f < sourceFrames; f++) {
-            selectedMono[f] = in.monoAt(startFrame + f);
-        }
-
-        int[] coreInfo = nativeFindStableVoicedCore(selectedMono, in.sampleRate);
-        if (coreInfo == null || coreInfo.length < 3) {
+        AnalysisChoice analysis = chooseBestAnalysis(in, startFrame, endFrame);
+        if (analysis == null || analysis.coreInfo == null || analysis.coreInfo.length < 3) {
             throw new IllegalArgumentException(
                     "Não consegui detectar periodicidade suficiente nesse trecho. Se você está ouvindo uma vogal limpa, tente ampliar só alguns milissegundos para cada lado e tente novamente.");
         }
 
-        int coreStart = clamp(coreInfo[0], 0, sourceFrames - 1);
-        int coreEnd = clamp(coreInfo[1], coreStart + 1, sourceFrames);
-        int quality = coreInfo[2];
+        int coreStart = clamp(analysis.coreInfo[0], 0, sourceFrames - 1);
+        int coreEnd = clamp(analysis.coreInfo[1], coreStart + 1, sourceFrames);
+        int quality = analysis.coreInfo[2];
         int coreSourceFrames = coreEnd - coreStart;
 
         int minimumCore = Math.max(96, (int) Math.round(in.sampleRate * 0.025));
-        if (coreSourceFrames < minimumCore || quality < 140) {
+        if (coreSourceFrames < minimumCore || quality < 120) {
             throw new IllegalArgumentException(
                     "O trecho ficou curto ou pouco periódico demais para alongar com segurança. Tente pegar um pouco mais da mesma vogal.");
         }
@@ -61,15 +69,13 @@ final class WorldVocoderEngine {
         int attackFrames = coreStart;
         int releaseFrames = sourceFrames - coreEnd;
         int targetCoreFrames = targetFrames - attackFrames - releaseFrames;
-        if (targetCoreFrames < coreSourceFrames) {
-            targetCoreFrames = coreSourceFrames;
-        }
+        if (targetCoreFrames < coreSourceFrames) targetCoreFrames = coreSourceFrames;
 
-        float[] coreMono = Arrays.copyOfRange(selectedMono, coreStart, coreEnd);
-        float[] synthesized = nativeSynthesizeVowel(coreMono, in.sampleRate, targetCoreFrames);
+        float[] coreMono = Arrays.copyOfRange(analysis.samples, coreStart, coreEnd);
+        float[] synthesized = nativeSynthesizeIdentityLocked(coreMono, in.sampleRate, targetCoreFrames);
         if (synthesized == null || synthesized.length != targetCoreFrames) {
             throw new IllegalStateException(
-                    "A análise periódica não ficou confiável o bastante para sintetizar esse trecho sem destruir a voz. Tente mover um pouco os cortes.");
+                    "O sintetizador não conseguiu preservar pitch/formantes desse trecho. Tente mover os cortes alguns milissegundos.");
         }
 
         removeDc(synthesized);
@@ -79,7 +85,8 @@ final class WorldVocoderEngine {
         int channels = in.channels;
         int absoluteCoreStart = startFrame + coreStart;
         int absoluteCoreEnd = startFrame + coreEnd;
-        float[] channelGain = estimateChannelGains(in, absoluteCoreStart, absoluteCoreEnd);
+        float[] channelGain = estimateChannelGains(
+                in, absoluteCoreStart, absoluteCoreEnd, coreMono);
         float[] stretched = new float[targetFrames * channels];
 
         if (attackFrames > 0) {
@@ -136,35 +143,77 @@ final class WorldVocoderEngine {
         return new AudioData(in.sampleRate, channels, out);
     }
 
+    private static AnalysisChoice chooseBestAnalysis(AudioData in, int startFrame, int endFrame) {
+        int frames = endFrame - startFrame;
+        AnalysisChoice best = null;
+
+        // Try each physical channel first. This avoids phase cancellation from
+        // chorus/delay/stereo processing changing the vowel during analysis.
+        for (int c = 0; c < in.channels; c++) {
+            float[] candidate = new float[frames];
+            for (int f = 0; f < frames; f++) {
+                candidate[f] = in.samples[(startFrame + f) * in.channels + c];
+            }
+            best = chooseIfBetter(best, candidate, c, in.sampleRate, frames);
+        }
+
+        // Also try the normal mono/mid sum because many files are clean centered vocals.
+        if (in.channels > 1) {
+            float[] mid = new float[frames];
+            for (int f = 0; f < frames; f++) mid[f] = in.monoAt(startFrame + f);
+            best = chooseIfBetter(best, mid, in.channels, in.sampleRate, frames);
+        }
+
+        return best;
+    }
+
+    private static AnalysisChoice chooseIfBetter(AnalysisChoice current, float[] candidate,
+                                                 int mode, int sampleRate, int totalFrames) {
+        int[] info = nativeFindStableVoicedCore(candidate, sampleRate);
+        if (info == null || info.length < 3) return current;
+        int start = clamp(info[0], 0, Math.max(0, totalFrames - 1));
+        int end = clamp(info[1], start + 1, totalFrames);
+        int core = end - start;
+        int coverageBonus = (int) Math.round(220.0 * core / Math.max(1, totalFrames));
+        int score = info[2] + coverageBonus;
+        if (current == null || score > current.score) {
+            return new AnalysisChoice(candidate, info, mode, score);
+        }
+        return current;
+    }
+
     /** Returns {startSampleInclusive, endSampleExclusive, quality0to1000}. */
     private static native int[] nativeFindStableVoicedCore(float[] monoSamples, int sampleRate);
 
-    private static native float[] nativeSynthesizeVowel(float[] monoSamples, int sampleRate, int targetFrames);
+    private static native float[] nativeSynthesizeIdentityLocked(
+            float[] monoSamples, int sampleRate, int targetFrames);
 
-    private static float[] estimateChannelGains(AudioData in, int start, int end) {
+    private static float[] estimateChannelGains(AudioData in, int start, int end,
+                                                float[] analysisCore) {
         float[] gains = new float[in.channels];
         if (in.channels == 1) {
             gains[0] = 1f;
             return gains;
         }
+
+        int refMargin = analysisCore.length / 5;
+        double referenceRms = rms(analysisCore, refMargin, analysisCore.length - refMargin);
+        referenceRms = Math.max(1e-6, referenceRms);
+
         int margin = Math.min((end - start) / 4, Math.max(1, in.sampleRate / 50));
         int from = Math.min(end - 1, start + margin);
         int to = Math.max(from + 1, end - margin);
-        double monoEnergy = 0.0;
         double[] channelEnergy = new double[in.channels];
         for (int f = from; f < to; f++) {
-            float mono = in.monoAt(f);
-            monoEnergy += mono * mono;
             int base = f * in.channels;
             for (int c = 0; c < in.channels; c++) {
                 double v = in.samples[base + c];
                 channelEnergy[c] += v * v;
             }
         }
-        monoEnergy = Math.sqrt(monoEnergy / Math.max(1, to - from));
         for (int c = 0; c < in.channels; c++) {
-            double rms = Math.sqrt(channelEnergy[c] / Math.max(1, to - from));
-            gains[c] = (float) clamp(rms / Math.max(1e-6, monoEnergy), 0.35, 1.8);
+            double channelRms = Math.sqrt(channelEnergy[c] / Math.max(1, to - from));
+            gains[c] = (float) clamp(channelRms / referenceRms, 0.25, 2.0);
         }
         return gains;
     }
