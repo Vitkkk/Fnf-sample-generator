@@ -15,16 +15,40 @@
 
 namespace {
 constexpr double kFramePeriodMs = 5.0;
-constexpr double kF0Floor = 71.0;
-constexpr double kF0Ceil = 1100.0;
+// FNF/chromatic voices can be much lower or higher than normal speech.
+constexpr double kF0Floor = 45.0;
+constexpr double kF0Ceil = 1800.0;
 constexpr char kLogTag[] = "VocalWorld";
 
 double Clamp(double v, double lo, double hi) {
   return std::max(lo, std::min(hi, v));
 }
 
+bool IsVoicedF0(double f0) {
+  return f0 >= kF0Floor && f0 <= kF0Ceil && std::isfinite(f0);
+}
+
+double Median(std::vector<double> values) {
+  if (values.empty()) return 0.0;
+  const size_t mid = values.size() / 2;
+  std::nth_element(values.begin(), values.begin() + mid, values.end());
+  double result = values[mid];
+  if ((values.size() & 1u) == 0u) {
+    const auto lower = std::max_element(values.begin(), values.begin() + mid);
+    if (lower != values.begin() + mid) result = (*lower + result) * 0.5;
+  }
+  return result;
+}
+
+void RemoveMean(std::vector<double>* x) {
+  if (x == nullptr || x->empty()) return;
+  const double mean = std::accumulate(x->begin(), x->end(), 0.0) /
+                      static_cast<double>(x->size());
+  for (double& v : *x) v -= mean;
+}
+
 double EstimateFallbackF0(const std::vector<double>& x, int fs) {
-  if (x.size() < static_cast<size_t>(fs / 40)) return 220.0;
+  if (x.size() < static_cast<size_t>(fs / 50)) return 220.0;
 
   const int desired = std::min<int>(static_cast<int>(x.size()), fs * 3 / 20);
   const int start = std::max(0, (static_cast<int>(x.size()) - desired) / 2);
@@ -35,7 +59,7 @@ double EstimateFallbackF0(const std::vector<double>& x, int fs) {
   for (int i = 0; i < n; ++i) mean += x[start + i];
   mean /= n;
 
-  const int min_lag = std::max(8, fs / static_cast<int>(kF0Ceil));
+  const int min_lag = std::max(4, fs / static_cast<int>(kF0Ceil));
   const int max_lag = std::min(n / 2, fs / static_cast<int>(kF0Floor));
   double best_corr = -1.0;
   int best_lag = std::max(min_lag, 1);
@@ -65,8 +89,32 @@ double EstimateFallbackF0(const std::vector<double>& x, int fs) {
   return Clamp(static_cast<double>(fs) / best_lag, kF0Floor, kF0Ceil);
 }
 
-bool IsVoicedF0(double f0) {
-  return f0 >= kF0Floor && f0 <= kF0Ceil && std::isfinite(f0);
+bool AnalyzeF0(const std::vector<double>& x, int fs,
+               std::vector<double>* time_axis,
+               std::vector<double>* f0) {
+  if (time_axis == nullptr || f0 == nullptr || x.empty() || fs <= 0) return false;
+
+  DioOption dio_option;
+  InitializeDioOption(&dio_option);
+  dio_option.frame_period = kFramePeriodMs;
+  dio_option.speed = 1;
+  dio_option.f0_floor = kF0Floor;
+  dio_option.f0_ceil = kF0Ceil;
+  dio_option.allowed_range = 0.10;
+
+  const int length = GetSamplesForDIO(
+      fs, static_cast<int>(x.size()), kFramePeriodMs);
+  if (length < 2) return false;
+
+  time_axis->assign(static_cast<size_t>(length), 0.0);
+  f0->assign(static_cast<size_t>(length), 0.0);
+  std::vector<double> raw(static_cast<size_t>(length), 0.0);
+
+  Dio(x.data(), static_cast<int>(x.size()), fs, &dio_option,
+      time_axis->data(), raw.data());
+  StoneMask(x.data(), static_cast<int>(x.size()), fs,
+            time_axis->data(), raw.data(), length, f0->data());
+  return true;
 }
 
 std::vector<double> MakeContinuousF0(const std::vector<double>& raw,
@@ -105,8 +153,6 @@ std::vector<double> MakeContinuousF0(const std::vector<double>& raw,
     }
   }
 
-  // Tiny three-frame smoothing removes isolated tracker jumps without flattening
-  // the actual pitch contour/vibrato of the selected vowel.
   if (n >= 3) {
     std::vector<double> smooth(out);
     for (int i = 1; i < n - 1; ++i) {
@@ -120,10 +166,17 @@ std::vector<double> MakeContinuousF0(const std::vector<double>& raw,
   return out;
 }
 
-// Time map used by v0.4. The source is traversed exactly once and never wraps.
-// The central 64% of the selected vowel occupies 76% of output time, while the
-// first/last 18% move a little faster. This protects vowel onset/release from
-// becoming unnaturally slow while still truly stretching the whole trajectory.
+double FrameRms(const std::vector<double>& x, int fs, double time_seconds) {
+  const int center = static_cast<int>(std::llround(time_seconds * fs));
+  const int radius = std::max(16, static_cast<int>(std::llround(fs * 0.0125)));
+  const int from = std::max(0, center - radius);
+  const int to = std::min(static_cast<int>(x.size()), center + radius + 1);
+  if (to <= from) return 0.0;
+  double energy = 0.0;
+  for (int i = from; i < to; ++i) energy += x[i] * x[i];
+  return std::sqrt(energy / std::max(1, to - from));
+}
+
 double ElasticSourcePosition(double u) {
   u = Clamp(u, 0.0, 1.0);
   constexpr double out_edge = 0.12;
@@ -145,7 +198,126 @@ double InterpolateLog(double a, double b, double t) {
   return std::exp(std::log(a) * (1.0 - t) + std::log(b) * t);
 }
 
+std::vector<double> JFloatToDouble(JNIEnv* env, jfloatArray samples) {
+  const jsize n = env->GetArrayLength(samples);
+  std::vector<jfloat> tmp(static_cast<size_t>(n));
+  env->GetFloatArrayRegion(samples, 0, n, tmp.data());
+  std::vector<double> x(static_cast<size_t>(n));
+  for (int i = 0; i < n; ++i) x[i] = static_cast<double>(tmp[i]);
+  RemoveMean(&x);
+  return x;
+}
+
 }  // namespace
+
+extern "C" JNIEXPORT jintArray JNICALL
+Java_com_vitkkk_vocalstretcher_WorldVocoderEngine_nativeFindStableVoicedCore(
+    JNIEnv* env, jclass, jfloatArray mono_samples, jint sample_rate) {
+  if (mono_samples == nullptr || sample_rate <= 0) return nullptr;
+  const jsize input_length = env->GetArrayLength(mono_samples);
+  if (input_length < 256) return nullptr;
+
+  std::vector<double> x = JFloatToDouble(env, mono_samples);
+  std::vector<double> time_axis;
+  std::vector<double> f0;
+  if (!AnalyzeF0(x, sample_rate, &time_axis, &f0)) return nullptr;
+
+  const int n = static_cast<int>(f0.size());
+  std::vector<double> voiced_f0;
+  std::vector<double> voiced_energy;
+  std::vector<double> energy(static_cast<size_t>(n), 0.0);
+  for (int i = 0; i < n; ++i) {
+    energy[i] = FrameRms(x, sample_rate, time_axis[i]);
+    if (IsVoicedF0(f0[i])) {
+      voiced_f0.push_back(f0[i]);
+      voiced_energy.push_back(energy[i]);
+    }
+  }
+  if (voiced_f0.size() < 3) return nullptr;
+
+  const double median_f0 = Median(voiced_f0);
+  const double median_energy = std::max(1e-9, Median(voiced_energy));
+  std::vector<uint8_t> good(static_cast<size_t>(n), 0);
+  int voiced_total = 0;
+  for (int i = 0; i < n; ++i) {
+    if (!IsVoicedF0(f0[i])) continue;
+    ++voiced_total;
+    const double cents = std::abs(1200.0 * std::log2(
+        std::max(kF0Floor, f0[i]) / std::max(kF0Floor, median_f0)));
+    const bool enough_energy = energy[i] >= std::max(1e-6, median_energy * 0.10);
+    // Wide enough for strong vibrato / character voices, tight enough to reject
+    // octave-tracker mistakes and consonant/breath frames.
+    if (enough_energy && cents <= 850.0) good[i] = 1;
+  }
+
+  // Bridge one isolated detector dropout inside an otherwise voiced vowel.
+  for (int i = 1; i < n - 1; ++i) {
+    if (!good[i] && good[i - 1] && good[i + 1]) good[i] = 1;
+  }
+
+  int best_start = -1;
+  int best_end = -1;
+  int run_start = -1;
+  for (int i = 0; i <= n; ++i) {
+    const bool is_good = i < n && good[i] != 0;
+    if (is_good && run_start < 0) run_start = i;
+    if ((!is_good || i == n) && run_start >= 0) {
+      if (best_start < 0 || i - run_start > best_end - best_start) {
+        best_start = run_start;
+        best_end = i;
+      }
+      run_start = -1;
+    }
+  }
+
+  if (best_start < 0 || best_end <= best_start) return nullptr;
+  const int best_frames = best_end - best_start;
+  const int minimum_frames = std::max(
+      4, static_cast<int>(std::ceil(35.0 / kFramePeriodMs)));
+  if (best_frames < minimum_frames) return nullptr;
+
+  // Give the stable core half a WORLD frame of context at each side, but do not
+  // absorb consonants/silence back into it.
+  const double start_seconds = std::max(
+      0.0, time_axis[best_start] - kFramePeriodMs / 2000.0);
+  const double end_seconds = std::min(
+      input_length / static_cast<double>(sample_rate),
+      time_axis[best_end - 1] + kFramePeriodMs / 1000.0 +
+          kFramePeriodMs / 2000.0);
+  int start_sample = static_cast<int>(std::llround(start_seconds * sample_rate));
+  int end_sample = static_cast<int>(std::llround(end_seconds * sample_rate));
+  start_sample = std::max(0, std::min(start_sample, input_length - 1));
+  end_sample = std::max(start_sample + 1, std::min(end_sample, input_length));
+
+  std::vector<double> run_cents;
+  run_cents.reserve(static_cast<size_t>(best_frames));
+  for (int i = best_start; i < best_end; ++i) {
+    if (IsVoicedF0(f0[i])) {
+      run_cents.push_back(std::abs(1200.0 * std::log2(
+          std::max(kF0Floor, f0[i]) / std::max(kF0Floor, median_f0))));
+    }
+  }
+  const double cents_mad = Median(run_cents);
+  const double pitch_stability = std::exp(-cents_mad / 420.0);
+  const double coverage = best_frames / static_cast<double>(std::max(1, n));
+  const double voiced_ratio = voiced_total / static_cast<double>(std::max(1, n));
+  const int quality = static_cast<int>(std::llround(1000.0 * Clamp(
+      0.58 * pitch_stability +
+      0.24 * std::min(1.0, coverage / 0.40) +
+      0.18 * voiced_ratio,
+      0.0, 1.0)));
+
+  jintArray result = env->NewIntArray(3);
+  if (result == nullptr) return nullptr;
+  const jint values[3] = {start_sample, end_sample, quality};
+  env->SetIntArrayRegion(result, 0, 3, values);
+
+  __android_log_print(
+      ANDROID_LOG_INFO, kLogTag,
+      "Stable core: samples=%d..%d quality=%d voiced=%d/%d medianF0=%.2f",
+      start_sample, end_sample, quality, voiced_total, n, median_f0);
+  return result;
+}
 
 extern "C" JNIEXPORT jfloatArray JNICALL
 Java_com_vitkkk_vocalstretcher_WorldVocoderEngine_nativeSynthesizeVowel(
@@ -157,43 +329,33 @@ Java_com_vitkkk_vocalstretcher_WorldVocoderEngine_nativeSynthesizeVowel(
 
   const jsize input_length = env->GetArrayLength(mono_samples);
   if (input_length < 256) return nullptr;
+  std::vector<double> x = JFloatToDouble(env, mono_samples);
 
-  std::vector<jfloat> input_float(static_cast<size_t>(input_length));
-  env->GetFloatArrayRegion(mono_samples, 0, input_length, input_float.data());
+  std::vector<double> time_axis;
+  std::vector<double> f0;
+  if (!AnalyzeF0(x, sample_rate, &time_axis, &f0)) return nullptr;
+  const int f0_length = static_cast<int>(f0.size());
 
-  std::vector<double> x(static_cast<size_t>(input_length));
-  double mean = 0.0;
-  for (int i = 0; i < input_length; ++i) mean += input_float[i];
-  mean /= input_length;
-  for (int i = 0; i < input_length; ++i) {
-    x[i] = static_cast<double>(input_float[i]) - mean;
+  int voiced_count = 0;
+  std::vector<double> voiced_values;
+  for (double value : f0) {
+    if (IsVoicedF0(value)) {
+      ++voiced_count;
+      voiced_values.push_back(value);
+    }
+  }
+  // Refuse to turn mostly-unvoiced material into synthetic whisper noise.
+  if (voiced_count < 3 || voiced_count < static_cast<int>(std::ceil(f0_length * 0.25))) {
+    __android_log_print(ANDROID_LOG_WARN, kLogTag,
+                        "Rejected WORLD synthesis: voiced=%d/%d",
+                        voiced_count, f0_length);
+    return nullptr;
   }
 
-  DioOption dio_option;
-  InitializeDioOption(&dio_option);
-  dio_option.frame_period = kFramePeriodMs;
-  dio_option.speed = 1;
-  dio_option.f0_floor = kF0Floor;
-  dio_option.f0_ceil = kF0Ceil;
-  dio_option.allowed_range = 0.10;
-
-  const int f0_length =
-      GetSamplesForDIO(sample_rate, input_length, kFramePeriodMs);
-  if (f0_length < 2) return nullptr;
-
-  std::vector<double> time_axis(static_cast<size_t>(f0_length));
-  std::vector<double> f0(static_cast<size_t>(f0_length));
-  std::vector<double> refined_f0(static_cast<size_t>(f0_length));
-
-  Dio(x.data(), input_length, sample_rate, &dio_option, time_axis.data(),
-      f0.data());
-  StoneMask(x.data(), input_length, sample_rate, time_axis.data(), f0.data(),
-            f0_length, refined_f0.data());
-  f0.swap(refined_f0);
-
-  const double fallback_f0 = EstimateFallbackF0(x, sample_rate);
-  const std::vector<double> continuous_f0 =
-      MakeContinuousF0(f0, fallback_f0);
+  const double fallback_f0 = voiced_values.empty()
+                                 ? EstimateFallbackF0(x, sample_rate)
+                                 : Median(voiced_values);
+  const std::vector<double> continuous_f0 = MakeContinuousF0(f0, fallback_f0);
 
   CheapTrickOption cheap_option;
   InitializeCheapTrickOption(sample_rate, &cheap_option);
@@ -205,13 +367,13 @@ Java_com_vitkkk_vocalstretcher_WorldVocoderEngine_nativeSynthesizeVowel(
       static_cast<size_t>(f0_length),
       std::vector<double>(static_cast<size_t>(bins)));
   std::vector<double*> spec_ptrs(static_cast<size_t>(f0_length));
-  for (int i = 0; i < f0_length; ++i) {
-    spec_ptrs[i] = spectrogram[i].data();
-  }
+  for (int i = 0; i < f0_length; ++i) spec_ptrs[i] = spectrogram[i].data();
 
-  // WORLD still receives its original voiced/unvoiced decisions for analysis.
-  CheapTrick(x.data(), input_length, sample_rate, time_axis.data(), f0.data(),
-             f0_length, &cheap_option, spec_ptrs.data());
+  // IMPORTANT v0.5.3: this is a verified voiced vowel core. Feeding raw DIO
+  // zeros into CheapTrick/D4C made some files become whisper/TTS noise. Use the
+  // repaired continuous F0 for analysis of this core as well as synthesis.
+  CheapTrick(x.data(), input_length, sample_rate, time_axis.data(),
+             continuous_f0.data(), f0_length, &cheap_option, spec_ptrs.data());
 
   D4COption d4c_option;
   InitializeD4COption(&d4c_option);
@@ -219,22 +381,15 @@ Java_com_vitkkk_vocalstretcher_WorldVocoderEngine_nativeSynthesizeVowel(
       static_cast<size_t>(f0_length),
       std::vector<double>(static_cast<size_t>(bins)));
   std::vector<double*> aper_ptrs(static_cast<size_t>(f0_length));
-  for (int i = 0; i < f0_length; ++i) {
-    aper_ptrs[i] = aperiodicity[i].data();
-  }
+  for (int i = 0; i < f0_length; ++i) aper_ptrs[i] = aperiodicity[i].data();
 
-  D4C(x.data(), input_length, sample_rate, time_axis.data(), f0.data(),
-      f0_length, fft_size, &d4c_option, aper_ptrs.data());
+  D4C(x.data(), input_length, sample_rate, time_axis.data(),
+      continuous_f0.data(), f0_length, fft_size, &d4c_option, aper_ptrs.data());
 
-  const double frame_hop_samples =
-      sample_rate * kFramePeriodMs / 1000.0;
+  const double frame_hop_samples = sample_rate * kFramePeriodMs / 1000.0;
   const int out_parameter_frames = std::max(
       2, static_cast<int>(std::ceil(target_frames / frame_hop_samples)) + 2);
 
-  // v0.4: no stationary average. Every output analysis frame is generated by
-  // interpolating a progressively moving position in the ORIGINAL WORLD
-  // parameter trajectory. The source position is strictly monotonic and never
-  // wraps, so neither PCM nor vocoder frames are duplicated in a tiled loop.
   std::vector<double> out_f0(static_cast<size_t>(out_parameter_frames));
   std::vector<std::vector<double>> out_spec(
       static_cast<size_t>(out_parameter_frames),
@@ -242,34 +397,26 @@ Java_com_vitkkk_vocalstretcher_WorldVocoderEngine_nativeSynthesizeVowel(
   std::vector<std::vector<double>> out_aper(
       static_cast<size_t>(out_parameter_frames),
       std::vector<double>(static_cast<size_t>(bins)));
-  std::vector<const double*> out_spec_ptrs(
-      static_cast<size_t>(out_parameter_frames));
-  std::vector<const double*> out_aper_ptrs(
-      static_cast<size_t>(out_parameter_frames));
+  std::vector<const double*> out_spec_ptrs(static_cast<size_t>(out_parameter_frames));
+  std::vector<const double*> out_aper_ptrs(static_cast<size_t>(out_parameter_frames));
 
   for (int j = 0; j < out_parameter_frames; ++j) {
     const double u = (out_parameter_frames <= 1)
                          ? 0.0
                          : j / static_cast<double>(out_parameter_frames - 1);
     const double source_norm = ElasticSourcePosition(u);
-    const double source_pos =
-        source_norm * static_cast<double>(std::max(0, f0_length - 1));
+    const double source_pos = source_norm * static_cast<double>(std::max(0, f0_length - 1));
     const int i0 = std::max(
         0, std::min(static_cast<int>(std::floor(source_pos)), f0_length - 1));
-    const int i1 = std::max(
-        0, std::min(i0 + 1, f0_length - 1));
+    const int i1 = std::max(0, std::min(i0 + 1, f0_length - 1));
     const double a = Clamp(source_pos - i0, 0.0, 1.0);
 
     out_f0[j] = InterpolateLog(continuous_f0[i0], continuous_f0[i1], a);
-
     for (int b = 0; b < bins; ++b) {
-      // Log interpolation preserves formant peaks much better than linearly
-      // averaging magnitudes and, crucially, keeps their movement through time.
-      out_spec[j][b] = InterpolateLog(
-          spectrogram[i0][b], spectrogram[i1][b], a);
+      out_spec[j][b] = InterpolateLog(spectrogram[i0][b], spectrogram[i1][b], a);
       out_aper[j][b] = Clamp(
           aperiodicity[i0][b] * (1.0 - a) + aperiodicity[i1][b] * a,
-          0.001, 0.999);
+          0.001, 0.985);
     }
     out_spec_ptrs[j] = out_spec[j].data();
     out_aper_ptrs[j] = out_aper[j].data();
@@ -280,9 +427,8 @@ Java_com_vitkkk_vocalstretcher_WorldVocoderEngine_nativeSynthesizeVowel(
             out_aper_ptrs.data(), fft_size, kFramePeriodMs, sample_rate,
             target_frames, y.data());
 
-  double y_mean =
-      std::accumulate(y.begin(), y.end(), 0.0) /
-      std::max<size_t>(1, y.size());
+  const double y_mean = std::accumulate(y.begin(), y.end(), 0.0) /
+                        std::max<size_t>(1, y.size());
   double peak = 1e-9;
   for (double& v : y) {
     v -= y_mean;
@@ -294,15 +440,13 @@ Java_com_vitkkk_vocalstretcher_WorldVocoderEngine_nativeSynthesizeVowel(
   if (result == nullptr) return nullptr;
   std::vector<jfloat> output(static_cast<size_t>(target_frames));
   for (int i = 0; i < target_frames; ++i) {
-    output[i] = static_cast<jfloat>(
-        Clamp(y[i] * safety, -1.0, 1.0));
+    output[i] = static_cast<jfloat>(Clamp(y[i] * safety, -1.0, 1.0));
   }
   env->SetFloatArrayRegion(result, 0, target_frames, output.data());
 
   __android_log_print(
       ANDROID_LOG_INFO, kLogTag,
-      "WORLD v0.4 elastic synth: input=%d target=%d fs=%d f0Frames=%d outFrames=%d",
-      input_length, target_frames, sample_rate, f0_length,
-      out_parameter_frames);
+      "WORLD v0.5.3 voiced-core synth: input=%d target=%d fs=%d voiced=%d/%d",
+      input_length, target_frames, sample_rate, voiced_count, f0_length);
   return result;
 }
